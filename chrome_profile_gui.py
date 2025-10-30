@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Chrome Profile Transfer GUI (Tkinter) — v1.1
+Chrome Profile Transfer GUI (Tkinter) — v1.3
 ---------------------------------------------
-NEW in v1.1:
-- Tự đọc file "Local State" để lấy **tên hiển thị (display name)** của các profile.
-- Combo box sẽ hiển thị:  "<folder> — <display name>"  (VD: "Profile 1 — Hồng Hào")
-- Vẫn cho phép chọn thủ công thư mục profile nếu muốn.
+Fixes & improvements:
+- Restore: luôn tạo thư mục "Profile N" tiếp theo (Profile 1, 2, ...).
+- Ghi tên hiển thị vào cả:
+    * Local State -> profile.info_cache[folder].name
+    * Preferences (trong thư mục profile) -> profile.name
+- Cập nhật profile.last_used và last_active_profiles.
+- Xử lý trường hợp file .zip có cấu trúc lồng 1 thư mục gốc.
+- Tìm và mở Chrome theo nhiều biến thể (Stable/Beta/Canary/Linux).
+- Tăng độ an toàn khi ghi Local State (backup, thử lại nếu bị khoá).
 
-Export (backup) và Import (restore) profile Chrome giữa 2 máy.
-Lưu ý về mật khẩu/cookies: có thể không hoạt động trên máy khác do mã hoá theo OS/user.
+Lưu ý: mật khẩu/cookies có thể không hoạt động giữa máy khác do cơ chế mã hoá OS/user.
 """
 
 import json
@@ -24,17 +28,17 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-APP_TITLE = "Chrome Profile Transfer (Tkinter) v1.1"
+APP_TITLE = "Chrome Profile Transfer (Tkinter) v1.3"
 DEFAULT_ZIP_NAME = "chrome_profile_backup.zip"
 
 def chrome_process_names():
     system = platform.system()
     if system == "Windows":
-        return ["chrome.exe"]
+        return ["chrome.exe", "chrome", "googleupdate.exe"]
     elif system == "Darwin":
         return ["Google Chrome", "Google Chrome Helper"]
     else:
-        return ["chrome", "chrome-browser", "google-chrome", "google-chrome-stable", "chromium", "chromium-browser"]
+        return ["chrome", "google-chrome", "google-chrome-stable", "chromium", "chromium-browser"]
 
 def kill_chrome(logfn=print):
     system = platform.system()
@@ -49,7 +53,7 @@ def kill_chrome(logfn=print):
         logfn("Đã cố gắng đóng Chrome (nếu đang chạy).")
     except Exception as e:
         logfn(f"Lỗi khi đóng Chrome: {e}")
-    time.sleep(1.0)
+    time.sleep(1.2)
 
 def user_profile_base():
     user_home = Path.home()
@@ -63,14 +67,29 @@ def user_profile_base():
         return user_home / ".config" / "google-chrome"
 
 def local_state_path():
-    """Path tới file 'Local State' (cùng cấp với các thư mục profile)."""
     return user_profile_base() / "Local State"
 
+def read_json(path: Path, default=None):
+    try:
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {} if default is None else default
+
+def write_json_atomic(path: Path, obj, logfn=print):
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        txt = json.dumps(obj, ensure_ascii=False, indent=2)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(txt, encoding="utf-8")
+        tmp.replace(path)
+        return True
+    except Exception as e:
+        logfn(f"Lỗi ghi JSON: {e}")
+        return False
+
 def read_profile_display_names():
-    """
-    Đọc 'Local State' để lấy tên hiển thị của các profile.
-    Trả về dict: { 'Default': 'Person 1', 'Profile 1': 'Work', ... }
-    """
     path = local_state_path()
     mapping = {}
     try:
@@ -81,16 +100,10 @@ def read_profile_display_names():
                 disp = meta.get("name") or meta.get("shortcut_name") or folder
                 mapping[folder] = disp
     except Exception:
-        # Nếu lỗi parse, trả về rỗng => fallback dùng tên thư mục
         pass
     return mapping
 
 def list_profiles_with_names():
-    """
-    Liệt kê các thư mục profile thực có mặt trên đĩa,
-    kèm tên hiển thị đọc từ Local State (nếu có).
-    Trả về list các tuple: (folder_name, display_name)
-    """
     base = user_profile_base()
     name_map = read_profile_display_names()
     results = []
@@ -98,7 +111,6 @@ def list_profiles_with_names():
         for p in base.iterdir():
             if p.is_dir() and (p.name == "Default" or p.name.startswith("Profile ")):
                 results.append((p.name, name_map.get(p.name, p.name)))
-    # Sắp xếp: 'Default' trước, sau đó Profile N tăng dần
     def sort_key(t):
         folder = t[0]
         if folder == "Default":
@@ -109,6 +121,20 @@ def list_profiles_with_names():
             num = 99999
         return (1, num)
     return sorted(results, key=sort_key)
+
+def next_profile_folder_name():
+    base = user_profile_base()
+    max_n = 0
+    if base.exists():
+        for p in base.iterdir():
+            if p.is_dir() and p.name.startswith("Profile "):
+                try:
+                    n = int(p.name.split(" ")[1])
+                    if n > max_n:
+                        max_n = n
+                except Exception:
+                    pass
+    return f"Profile {max_n + 1}"
 
 def default_profile_path(profile_folder="Default"):
     return user_profile_base() / profile_folder
@@ -128,16 +154,156 @@ def unzip_to_folder(zip_path: Path, dest_folder: Path):
     with zipfile.ZipFile(zip_path, 'r') as zf:
         zf.extractall(dest_folder)
 
+def flatten_if_wrapped(root: Path, logfn=print):
+    """
+    Nếu zip giải nén ra 1 thư mục con duy nhất (wrap), di chuyển
+    toàn bộ nội dung thư mục con đó lên root.
+    """
+    try:
+        items = list(root.iterdir())
+        if len(items) == 1 and items[0].is_dir():
+            inner = items[0]
+            logfn(f"Phát hiện gói lồng: đang dỡ nội dung {inner.name} lên {root.name}")
+            for p in inner.iterdir():
+                shutil.move(str(p), str(root / p.name))
+            inner.rmdir()
+    except Exception as e:
+        logfn(f"Không thể flatten zip: {e}")
+
+def try_get_profile_name_from_preferences(profile_dir: Path):
+    prefs_path = profile_dir / "Preferences"
+    try:
+        if prefs_path.exists():
+            prefs = json.loads(prefs_path.read_text(encoding="utf-8"))
+            prof = prefs.get("profile", {})
+            name = prof.get("name")
+            if isinstance(name, str) and name.strip():
+                return name.strip()
+    except Exception:
+        pass
+    return None
+
+def ensure_preferences_display_name(profile_dir: Path, display_name: str, logfn=print):
+    """Ghi 'profile.name' trong Preferences nếu khác tên mong muốn."""
+    prefs_path = profile_dir / "Preferences"
+    try:
+        prefs = read_json(prefs_path, default={})
+        prof = prefs.setdefault("profile", {})
+        if prof.get("name") != display_name:
+            prof["name"] = display_name
+            # avatar_index mặc định nếu chưa có
+            prof.setdefault("avatar_index", 26)
+            tmp_ok = write_json_atomic(prefs_path, prefs, logfn)
+            if tmp_ok:
+                logfn("Đã cập nhật Preferences: profile.name = " + display_name)
+    except Exception as e:
+        logfn(f"Lỗi khi ghi Preferences: {e}")
+
+def update_local_state_register_profile(folder_name: str, display_name: str, logfn=print):
+    """Thêm/ghi đè entry info_cache cho profile mới và đặt last_used."""
+    ls_path = local_state_path()
+    # backup trước khi ghi
+    try:
+        if ls_path.exists():
+            bak = ls_path.with_name(ls_path.name + ".bak_" + time.strftime("%Y%m%d_%H%M%S"))
+            shutil.copy2(ls_path, bak)
+    except Exception:
+        pass
+
+    data = read_json(ls_path, default={})
+    prof = data.setdefault("profile", {})
+    info_cache = prof.setdefault("info_cache", {})
+
+    meta = info_cache.get(folder_name, {})
+    meta["name"] = display_name
+    meta.setdefault("gaia_name", "")
+    meta.setdefault("user_name", "")
+    info_cache[folder_name] = meta
+
+    # last_used
+    prof["last_used"] = folder_name
+
+    # last_active_profiles: de-dup và đưa lên đầu
+    lst = prof.get("last_active_profiles", [])
+    if not isinstance(lst, list):
+        lst = []
+    lst = [x for x in lst if x != folder_name]
+    lst.insert(0, folder_name)
+    prof["last_active_profiles"] = lst
+
+    # ghi atomic
+    if write_json_atomic(ls_path, data, logfn):
+        logfn(f"Đã cập nhật Local State cho '{folder_name}' (name='{display_name}').")
+    else:
+        logfn("Không thể ghi Local State.")
+
+def find_chrome_candidates():
+    system = platform.system()
+    candidates = []
+    if system == "Windows":
+        candidates += [
+            Path("C:/Program Files/Google/Chrome/Application/chrome.exe"),
+            Path("C:/Program Files (x86)/Google/Chrome/Application/chrome.exe"),
+            Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Google/Chrome/Application/chrome.exe",
+            Path(os.environ.get("ProgramFiles(x86)", "C:/Program Files (x86)")) / "Google/Chrome/Application/chrome.exe",
+        ]
+    elif system == "Darwin":
+        candidates += [
+            Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+            Path("/Applications/Google Chrome Beta.app/Contents/MacOS/Google Chrome Beta"),
+            Path("/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary"),
+        ]
+    else:
+        # Linux
+        for cmd in ["google-chrome", "google-chrome-stable", "chrome", "chromium", "chromium-browser"]:
+            candidates.append(cmd)
+    return candidates
+
+def launch_chrome_with_profile(folder_name: str, logfn=print):
+    """Thử mở Chrome với profile chỉ định."""
+    args = ['--profile-directory=' + folder_name]
+    system = platform.system()
+    try:
+        candidates = find_chrome_candidates()
+        if system == "Linux":
+            for cmd in candidates:
+                try:
+                    subprocess.Popen([cmd, *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    logfn(f"Đã thử mở Chrome ({cmd}) với profile mới.")
+                    return
+                except Exception:
+                    continue
+            logfn("Không tìm thấy lệnh Chrome để mở tự động.")
+        else:
+            for exe in candidates:
+                if isinstance(exe, Path):
+                    if exe.exists():
+                        subprocess.Popen([str(exe), *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        logfn(f"Đã mở Chrome: {exe.name} với profile mới.")
+                        return
+                else:
+                    # string path (unlikely here)
+                    try:
+                        subprocess.Popen([exe, *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        logfn(f"Đã mở Chrome ({exe}) với profile mới.")
+                        return
+                    except Exception:
+                        pass
+            # Fallback to PATH on Windows/macOS too
+            subprocess.Popen(["chrome", *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            logfn("Đã thử mở Chrome qua PATH.")
+    except Exception as e:
+        logfn(f"Không mở được Chrome tự động: {e}")
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("900x620")
-        self.minsize(800, 580)
+        self.geometry("940x680")
+        self.minsize(840, 620)
 
-        # Data
-        self.profile_items = []   # list[(folder, display)]
-        self.combo_value_to_folder = {}  # display string -> folder
+        self.profile_items = []
+        self.combo_value_to_folder = {}
 
         self.create_widgets()
         self.populate_profiles()
@@ -154,7 +320,7 @@ class App(tk.Tk):
 
         row = 0
         ttk.Label(self.tab_export, text="Chọn profile cần export:").grid(row=row, column=0, sticky="w", **pad)
-        self.combo_profile = ttk.Combobox(self.tab_export, state="readonly", width=50)
+        self.combo_profile = ttk.Combobox(self.tab_export, state="readonly", width=54)
         self.combo_profile.grid(row=row, column=1, sticky="we", **pad)
         ttk.Button(self.tab_export, text="Refresh", command=self.populate_profiles).grid(row=row, column=2, **pad)
 
@@ -192,16 +358,13 @@ class App(tk.Tk):
         ttk.Button(self.tab_import, text="Chọn...", command=self.pick_zip_in).grid(row=row, column=2, **pad)
 
         row += 1
-        ttk.Label(self.tab_import, text="Tên profile đích (folder: Default / Profile 1 / ...):").grid(row=row, column=0, sticky="w", **pad)
-        self.entry_dest_profile = ttk.Entry(self.tab_import)
-        self.entry_dest_profile.insert(0, "Default")
-        self.entry_dest_profile.grid(row=row, column=1, sticky="we", **pad)
+        ttk.Label(self.tab_import, text="Tên hiển thị (tuỳ chọn, nếu để trống sẽ lấy từ Preferences hoặc dùng 'Profile N'):").grid(row=row, column=0, sticky="w", **pad)
+        self.entry_display_name = ttk.Entry(self.tab_import)
+        self.entry_display_name.grid(row=row, column=1, sticky="we", **pad)
 
         row += 1
-        ttk.Label(self.tab_import, text="Hoặc đường dẫn đích (tuỳ chọn):").grid(row=row, column=0, sticky="w", **pad)
-        self.entry_dest_path = ttk.Entry(self.tab_import)
-        self.entry_dest_path.grid(row=row, column=1, sticky="we", **pad)
-        ttk.Button(self.tab_import, text="Chọn...", command=self.pick_dest_folder).grid(row=row, column=2, **pad)
+        self.var_launch = tk.BooleanVar(value=True)
+        ttk.Checkbutton(self.tab_import, text="Mở Chrome ngay với profile vừa import", variable=self.var_launch).grid(row=row, column=1, sticky="w", **pad)
 
         row += 1
         self.var_kill2 = tk.BooleanVar(value=True)
@@ -216,10 +379,8 @@ class App(tk.Tk):
         # --- Log area ---
         self.frame_log = ttk.LabelFrame(self, text="Log")
         self.frame_log.pack(fill="both", expand=True, padx=10, pady=(0,10))
-        self.text_log = tk.Text(self.frame_log, height=10, wrap="word")
+        self.text_log = tk.Text(self.frame_log, height=12, wrap="word")
         self.text_log.pack(fill="both", expand=True, padx=8, pady=8)
-        self.scroll_log = ttk.Scrollbar(self.text_log, command=self.text_log.yview)
-        self.text_log.configure(yscrollcommand=self.scroll_log.set)
 
     # Helpers
     def log(self, msg):
@@ -245,7 +406,6 @@ class App(tk.Tk):
         if not self.combo_profile.get():
             self.combo_profile.set(display_values[0])
 
-        # Suggest default output zip
         desktop = Path.home() / "Desktop"
         default_zip = desktop / DEFAULT_ZIP_NAME if desktop.exists() else Path.cwd() / DEFAULT_ZIP_NAME
         if not self.entry_zip_out.get():
@@ -288,12 +448,6 @@ class App(tk.Tk):
             self.entry_zip_in.delete(0, "end")
             self.entry_zip_in.insert(0, f)
 
-    def pick_dest_folder(self):
-        d = filedialog.askdirectory(title="Chọn thư mục đích cho profile (sẽ là thư mục profile)")
-        if d:
-            self.entry_dest_path.delete(0, "end")
-            self.entry_dest_path.insert(0, d)
-
     # Export/Import actions
     def run_export(self):
         t = threading.Thread(target=self._do_export, daemon=True)
@@ -305,7 +459,6 @@ class App(tk.Tk):
 
     def _do_export(self):
         try:
-            # Determine source folder
             src_custom = self.entry_src_path.get().strip()
             if src_custom:
                 src = Path(src_custom)
@@ -348,49 +501,56 @@ class App(tk.Tk):
                 messagebox.showerror("Lỗi", f"Không tìm thấy file zip: {zip_in}")
                 return
 
-            dest_custom = self.entry_dest_path.get().strip()
-            if dest_custom:
-                dest = Path(dest_custom)
-            else:
-                prof_folder = self.entry_dest_profile.get().strip() or "Default"
-                dest = default_profile_path(prof_folder)
-
-            parent = dest.parent
-            parent.mkdir(parents=True, exist_ok=True)
-
-            self.log(f"File nhập: {zip_in}")
-            self.log(f"Thư mục profile đích: {dest}")
+            base = user_profile_base()
+            base.mkdir(parents=True, exist_ok=True)
 
             if self.var_kill2.get():
                 self.log("Đang đóng Chrome...")
                 kill_chrome(self.log)
 
-            # Backup existing folder
-            if dest.exists():
-                backup_copy = dest.with_name(dest.name + ".bak_" + time.strftime("%Y%m%d_%H%M%S"))
-                self.log(f"Đã tồn tại profile đích. Đang chuyển sang backup: {backup_copy}")
-                shutil.move(str(dest), str(backup_copy))
+            folder_name = next_profile_folder_name()
+            dest = base / folder_name
+
+            self.log(f"File nhập: {zip_in}")
+            self.log(f"Tạo profile mới: {folder_name}")
+            self.log(f"Thư mục profile đích: {dest}")
 
             tmpdir = dest.with_name(dest.name + "_tmp_" + time.strftime("%Y%m%d_%H%M%S"))
             tmpdir.mkdir(parents=True, exist_ok=True)
 
             self.log("Đang giải nén...")
             unzip_to_folder(zip_in, tmpdir)
+            flatten_if_wrapped(tmpdir, self.log)
 
             self.log("Đang hoàn tất import...")
             shutil.move(str(tmpdir), str(dest))
 
-            # On Linux/macOS, ensure ownership/permission (best effort)
+            # Đặt tên hiển thị
+            desired_name = self.entry_display_name.get().strip()
+            if not desired_name:
+                desired_name = try_get_profile_name_from_preferences(dest) or folder_name
+
+            # Cập nhật Preferences trong profile
+            ensure_preferences_display_name(dest, desired_name, self.log)
+
+            # Cập nhật Local State (đăng ký profile & set last_used)
+            update_local_state_register_profile(folder_name, desired_name, self.log)
+
+            # Fix quyền trên *nix
             try:
                 if platform.system() != "Windows":
                     import getpass
                     user = getpass.getuser()
-                    subprocess.run(["chown", "-R", f"{user}:{user}", str(dest)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    subprocess.run(["chown", "-R", f"{user}:{user}", str(dest)],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except Exception:
                 pass
 
-            self.log("Hoàn tất import! Hãy mở Chrome và kiểm tra.")
-            messagebox.showinfo("Xong", f"Import hoàn tất vào:\n{dest}")
+            self.log("Hoàn tất import!")
+            messagebox.showinfo("Xong", f"Đã import vào profile mới:\n{folder_name}\nTên hiển thị: {desired_name}\nThư mục: {dest}")
+
+            if self.var_launch.get():
+                launch_chrome_with_profile(folder_name, self.log)
 
         except Exception as e:
             self.log(f"Lỗi import: {e}")
